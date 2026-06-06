@@ -13,7 +13,9 @@ Usage:
 """
 
 import os
+import json
 import logging
+from pathlib import Path
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -27,6 +29,7 @@ from telegram.ext import (
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DATA_FILE = Path(os.getenv("MEETINGS_FILE", "meetings.json"))
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,8 +41,26 @@ logger = logging.getLogger(__name__)
 # ── Conversation states ────────────────────────────────────────────────────────
 DATE, TIME, TOPIC = range(3)
 
-# ── In-memory storage (per user) ──────────────────────────────────────────────
+# ── Persistent storage (per user) ─────────────────────────────────────────────
 # Structure: { user_id: {"date": ..., "time": ..., "topic": ...} }
+def load_meetings() -> dict[int, dict]:
+    if not DATA_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        # JSON keys are always strings — convert back to int
+        return {int(uid): data for uid, data in raw.items()}
+    except (json.JSONDecodeError, ValueError) as e:
+        logging.getLogger(__name__).warning("Could not read %s: %s", DATA_FILE, e)
+        return {}
+
+
+def save_meetings() -> None:
+    tmp = DATA_FILE.with_suffix(DATA_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(meetings, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(DATA_FILE)  # atomic on POSIX & Windows
+
+
 meetings: dict[int, dict] = {}
 
 
@@ -156,6 +177,7 @@ async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "time": context.user_data["time"],
         "topic": context.user_data["topic"],
     }
+    save_meetings()
 
     await update.message.reply_text(
         "✅ Meeting saved!\n\n" + format_meeting(meetings[user_id]),
@@ -195,6 +217,7 @@ async def clear_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     if user_id in meetings:
         del meetings[user_id]
+        save_meetings()
         await update.message.reply_text("🗑 Meeting cleared.")
     else:
         await update.message.reply_text("Nothing to clear – you have no saved meeting.")
@@ -203,6 +226,13 @@ async def clear_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ── App setup ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("TELEGRAM_BOT_TOKEN env variable is not set.")
+
+    global meetings
+    meetings = load_meetings()
+    logger.info("Loaded %d saved meeting(s) from %s", len(meetings), DATA_FILE)
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
