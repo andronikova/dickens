@@ -2,7 +2,7 @@
 
 A simple Telegram bot that saves your next meeting's **date**, **time**, and **topic**, then lets you view or clear it.
 
-Meetings are stored in memory per user — they are forgotten when the bot restarts.
+Meetings are persisted per user to `meetings.json` (path overridable via `MEETINGS_FILE`), so they survive restarts.
 
 ---
 
@@ -101,6 +101,83 @@ Send `/show_meeting` any time to see what's saved, or `/clear_meeting` to remove
 
 ---
 
+## Deploying updates to the live bot
+
+The bot runs on an Oracle Cloud VM as a systemd service called `dickens`. The first-time setup is in [`DEPLOY.md`](./DEPLOY.md). After that, shipping a new version is:
+
+### 1. Push code from your laptop
+
+```powershell
+git add <changed files>
+git commit -m "describe the change"
+git push
+```
+
+### 2. Pull and restart on the VM
+
+SSH in and run:
+
+```bash
+ssh ubuntu@92.5.91.104
+
+cd ~/dickens
+git pull
+sudo systemctl restart dickens
+```
+
+If you changed `requirements.txt`, also reinstall dependencies before the restart:
+
+```bash
+.venv/bin/pip install -r requirements.txt
+```
+
+### 3. Confirm it came up cleanly
+
+```bash
+sudo systemctl status dickens
+journalctl -u dickens -n 30 --no-pager
+```
+
+You want to see `Active: active (running)` and a recent `Bot is running…` log line. Send `/start` in Telegram as a final smoke test.
+
+### One-liner update script (optional)
+
+If you want a single command, create `~/update-bot.sh` on the VM once:
+
+```bash
+cat > ~/update-bot.sh <<'EOF'
+#!/bin/bash
+set -e
+cd ~/dickens
+git pull
+.venv/bin/pip install -q -r requirements.txt
+sudo systemctl restart dickens
+echo "✅ Bot updated."
+EOF
+chmod +x ~/update-bot.sh
+```
+
+Then future deploys are:
+
+```powershell
+# locally
+git push
+# on VM
+ssh ubuntu@92.5.91.104 ~/update-bot.sh
+```
+
+### Useful commands
+
+| Task              | Command                                     |
+| ----------------- | ------------------------------------------- |
+| Watch logs live   | `journalctl -u dickens -f`                  |
+| Recent logs       | `journalctl -u dickens -n 50 --no-pager`    |
+| Restart bot       | `sudo systemctl restart dickens`            |
+| Stop bot          | `sudo systemctl stop dickens`               |
+| Service status    | `sudo systemctl status dickens`             |
+
+---
+
 ## Troubleshooting
 
 - **`InvalidToken` on startup** — `TELEGRAM_BOT_TOKEN` is empty or wrong. Re-check step 3 of *Setup*.
@@ -112,5 +189,5 @@ Send `/show_meeting` any time to see what's saved, or `/clear_meeting` to remove
 
 ## Notes
 
-- Meetings are stored only in memory (`meetings: dict[int, dict]` in `meeting_bot.py`). Restarting the bot wipes all saved meetings.
+- Meetings are persisted to `meetings.json` (atomic write via a `.tmp` swap), so they survive restarts.
 - Each Telegram user has their own meeting slot — users don't see each other's data.
