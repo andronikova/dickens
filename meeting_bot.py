@@ -422,9 +422,24 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ── /show_meeting ──────────────────────────────────────────────────────────────
+# ── /show_next_meeting & /show_all_meetings ───────────────────────────────────
 
-async def show_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_next_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    upcoming, _ = _split_upcoming_past(meetings.get(user_id, []))
+    if not upcoming:
+        await update.message.reply_text(
+            "You have no upcoming meetings. Use /set\\_meeting to add one.",
+            parse_mode="Markdown",
+        )
+        return
+    await update.message.reply_text(
+        "📋 *Your next meeting:*\n\n" + format_meeting(upcoming[0]),
+        parse_mode="Markdown",
+    )
+
+
+async def show_all_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     upcoming, _ = _split_upcoming_past(meetings.get(user_id, []))
     if not upcoming:
@@ -590,7 +605,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(set_conv)
     app.add_handler(clear_conv)
-    app.add_handler(CommandHandler("show_meeting", show_meeting))
+    app.add_handler(CommandHandler("show_next_meeting", show_next_meeting))
+    app.add_handler(CommandHandler("show_all_meetings", show_all_meetings))
     app.add_handler(CommandHandler("archive", show_archive))
 
     logger.info("Bot is running…")
