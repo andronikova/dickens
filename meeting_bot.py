@@ -17,6 +17,7 @@ import json
 import logging
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder,
@@ -31,6 +32,13 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATA_FILE = Path(os.getenv("MEETINGS_FILE", "meetings.json"))
 
+# Display timezones: label → IANA zone name. "Europe" = Berlin (CET/CEST).
+DISPLAY_TIMEZONES: dict[str, str] = {
+    "Europe":    "Europe/Berlin",
+    "Moscow":    "Europe/Moscow",
+    "Hong Kong": "Asia/Hong_Kong",
+}
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ────────────────────────────────────────────────────────
-DATE, TIME, TOPIC = range(3)
+DATE, TIME, TIMEZONE, TOPIC = range(4)
 
 # ── Persistent storage (per user) ─────────────────────────────────────────────
 # Structure: { user_id: {"date": ..., "time": ..., "topic": ...} }
@@ -65,10 +73,26 @@ meetings: dict[int, dict] = {}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+def _format_times_block(iso_dt: str) -> str:
+    """Render the saved ISO datetime in each display timezone."""
+    dt = datetime.fromisoformat(iso_dt)
+    lines = []
+    for label, zone in DISPLAY_TIMEZONES.items():
+        local = dt.astimezone(ZoneInfo(zone))
+        lines.append(f"    • *{label}:* {local.strftime('%Y-%m-%d %H:%M')}")
+    return "\n".join(lines)
+
+
 def format_meeting(data: dict) -> str:
+    # New schema stores an ISO datetime; fall back to the legacy date/time fields.
+    if "datetime" in data:
+        return (
+            f"📝 *Topic:* {data['topic']}\n"
+            f"⏰ *Time:*\n{_format_times_block(data['datetime'])}"
+        )
     return (
-        f"📅 *Date:*  {data['date']}\n"
-        f"⏰ *Time:*  {data['time']}\n"
+        f"📅 *Date:*  {data.get('date', '?')}\n"
+        f"⏰ *Time:*  {data.get('time', '?')}\n"
         f"📝 *Topic:* {data['topic']}"
     )
 
@@ -125,6 +149,7 @@ async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return DATE
 
+    context.user_data["date_obj"] = parsed.date()
     context.user_data["date"] = parsed.strftime("%d %B %Y")  # e.g. "15 June 2025"
     await update.message.reply_text(
         f"Got it: *{context.user_data['date']}* ✅\n\n"
@@ -135,7 +160,7 @@ async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Store time and ask for topic."""
+    """Store time and ask which timezone it refers to."""
     raw = update.message.text.strip()
 
     parsed = None
@@ -153,11 +178,52 @@ async def receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return TIME
 
+    context.user_data["time_obj"] = parsed.time()
     context.user_data["time"] = parsed.strftime("%H:%M")
+
+    keyboard = ReplyKeyboardMarkup(
+        [list(DISPLAY_TIMEZONES.keys())],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
     await update.message.reply_text(
         f"Got it: *{context.user_data['time']}* ✅\n\n"
+        "Which *timezone* is that in?",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return TIMEZONE
+
+
+async def receive_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Combine date+time with the chosen timezone, then ask for topic."""
+    choice = update.message.text.strip()
+    if choice not in DISPLAY_TIMEZONES:
+        keyboard = ReplyKeyboardMarkup(
+            [list(DISPLAY_TIMEZONES.keys())],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        )
+        await update.message.reply_text(
+            "⚠️ Please pick one of the offered timezones:",
+            reply_markup=keyboard,
+        )
+        return TIMEZONE
+
+    zone = ZoneInfo(DISPLAY_TIMEZONES[choice])
+    aware = datetime.combine(
+        context.user_data["date_obj"],
+        context.user_data["time_obj"],
+        tzinfo=zone,
+    )
+    context.user_data["datetime"] = aware.isoformat()
+    context.user_data["source_tz"] = choice
+
+    await update.message.reply_text(
+        f"Saved as *{choice}* time ✅\n\n"
         "Finally, what is the *topic* of the meeting?",
         parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
     )
     return TOPIC
 
@@ -173,9 +239,9 @@ async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user_id = update.effective_user.id
 
     meetings[user_id] = {
-        "date": context.user_data["date"],
-        "time": context.user_data["time"],
-        "topic": context.user_data["topic"],
+        "datetime":  context.user_data["datetime"],
+        "source_tz": context.user_data["source_tz"],
+        "topic":     context.user_data["topic"],
     }
     save_meetings()
 
@@ -238,9 +304,10 @@ def main() -> None:
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("set_meeting", set_meeting_start)],
         states={
-            DATE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
-            TIME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time)],
-            TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_topic)],
+            DATE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
+            TIME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time)],
+            TIMEZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_timezone)],
+            TOPIC:    [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_topic)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
