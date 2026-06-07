@@ -1,2 +1,2 @@
-python-telegram-bot>=21,<22
+python-telegram-bot[job-queue]>=21,<22
 tzdata>=2024.1; sys_platform == "win32"
