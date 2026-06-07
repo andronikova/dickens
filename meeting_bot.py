@@ -19,6 +19,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -103,13 +104,13 @@ def format_meeting(data: dict) -> str:
     # New schema stores an ISO datetime; fall back to the legacy date/time fields.
     if "datetime" in data:
         return (
-            f"📝 *Topic:* {data['topic']}\n"
+            f"📝 *Topic:* {escape_markdown(data['topic'], version=1)}\n"
             f"⏰ *Time:*\n{_format_times_block(data['datetime'])}"
         )
     return (
         f"📅 *Date:*  {data.get('date', '?')}\n"
         f"⏰ *Time:*  {data.get('time', '?')}\n"
-        f"📝 *Topic:* {data.get('topic', '?')}"
+        f"📝 *Topic:* {escape_markdown(data.get('topic', '?'), version=1)}"
     )
 
 
@@ -145,7 +146,7 @@ def _short_label(m: dict) -> str:
     """One-liner used in pickers/lists: 'YYYY-MM-DD HH:MM TZ — topic'."""
     dt = _meeting_dt(m)
     when = dt.strftime("%Y-%m-%d %H:%M") + f" {m.get('source_tz', '')}" if dt else "?"
-    return f"{when.strip()} — {m.get('topic', '?')}"
+    return f"{when.strip()} — {escape_markdown(m.get('topic', '?'), version=1)}"
 
 
 # ── Reminders ─────────────────────────────────────────────────────────────────
@@ -258,7 +259,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 Hi! I'm your *Meeting Bot*.\n\n"
         "Commands:\n"
         "  /set\\_meeting – add a meeting\n"
-        "  /show\\_meeting – view upcoming meetings (closest first)\n"
+        "  /show\\_next\\_meeting – view the closest upcoming meeting\n"
+        "  /show\\_all\\_meetings – view all upcoming meetings (closest first)\n"
         "  /archive – view past meetings\n"
         "  /clear\\_meeting – pick a meeting to remove\n"
         "  /help – show this message",
@@ -487,9 +489,9 @@ async def receive_clear_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if raw == "all":
         items = meetings.get(user_id, [])
-        # Keep past entries; drop the upcoming ones we showed.
-        keep_ids = {id(m) for m in items if m not in upcoming}
-        meetings[user_id] = [m for m in items if id(m) in keep_ids]
+        # Keep past entries; drop the upcoming ones we showed. Compare by identity
+        # so value-identical past/upcoming meetings aren't conflated.
+        meetings[user_id] = [m for m in items if all(m is not u for u in upcoming)]
         save_meetings()
         _reschedule_user_reminders(context.application.job_queue, user_id)
         await update.message.reply_text(
@@ -526,7 +528,7 @@ async def receive_clear_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_meetings()
     _reschedule_user_reminders(context.application.job_queue, user_id)
     await update.message.reply_text(
-        f"🗑 Removed: *{target.get('topic', '?')}*",
+        f"🗑 Removed: *{escape_markdown(target.get('topic', '?'), version=1)}*",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
