@@ -18,12 +18,19 @@ import logging
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
     ContextTypes,
@@ -47,6 +54,9 @@ MONDAY_REMINDER_HOUR = 9
 # How many hours before the meeting the "starts soon" reminder fires.
 HOURS_BEFORE_REMINDER = 6
 
+# Telegram caps answerCallbackQuery popup text at 200 characters.
+CALLBACK_ALERT_LIMIT = 200
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -59,21 +69,24 @@ logger = logging.getLogger(__name__)
 # ── Conversation states ────────────────────────────────────────────────────────
 DATE, TIME, TIMEZONE, TOPIC, CLEAR_PICK = range(5)
 
-# ── Persistent storage (per user) ─────────────────────────────────────────────
-# Structure: { user_id: [ {"datetime": iso, "source_tz": label, "topic": str}, ... ] }
+# ── Persistent storage (per chat) ─────────────────────────────────────────────
+# Structure: { chat_id: [ {"datetime": iso, "source_tz": label, "topic": str}, ... ] }
+# In a 1:1 DM the chat_id equals the user's id, so legacy per-user entries keep
+# working untouched. Meetings added in groups now live under the group's chat id
+# and are visible to every participant.
 def load_meetings() -> dict[int, list[dict]]:
     if not DATA_FILE.exists():
         return {}
     try:
         raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
         result: dict[int, list[dict]] = {}
-        for uid, data in raw.items():
-            uid_int = int(uid)
+        for cid, data in raw.items():
+            cid_int = int(cid)
             if isinstance(data, list):
-                result[uid_int] = data
+                result[cid_int] = data
             elif isinstance(data, dict):
                 # Migrate legacy single-meeting schema into a one-item list.
-                result[uid_int] = [data]
+                result[cid_int] = [data]
         return result
     except (json.JSONDecodeError, ValueError) as e:
         logging.getLogger(__name__).warning("Could not read %s: %s", DATA_FILE, e)
@@ -149,15 +162,44 @@ def _short_label(m: dict) -> str:
     return f"{when.strip()} — {escape_markdown(m.get('topic', '?'), version=1)}"
 
 
-# ── Reminders ─────────────────────────────────────────────────────────────────
-# We only ever track the user's closest upcoming meeting. When it passes (or
-# when the user adds/removes meetings), we re-pick the closest and reschedule.
+# ── Plain-text rendering (for popup alerts, which don't support Markdown) ───────
 
-def _user_job_names(user_id: int) -> tuple[str, str, str]:
+def _short_label_plain(m: dict) -> str:
+    dt = _meeting_dt(m)
+    when = dt.strftime("%Y-%m-%d %H:%M") + f" {m.get('source_tz', '')}" if dt else "?"
+    return f"{when.strip()} — {m.get('topic', '?')}"
+
+
+def format_meeting_plain(data: dict) -> str:
+    """Plain-text version of format_meeting for callback popups."""
+    if "datetime" in data:
+        dt = datetime.fromisoformat(data["datetime"])
+        lines = [f"Topic: {data['topic']}", "Time:"]
+        for label, zone in DISPLAY_TIMEZONES.items():
+            local = dt.astimezone(ZoneInfo(zone))
+            lines.append(f"  {label}: {local.strftime('%Y-%m-%d %H:%M')}")
+        return "\n".join(lines)
     return (
-        f"monday_reminder_{user_id}",
-        f"six_h_reminder_{user_id}",
-        f"rotate_{user_id}",
+        f"Date: {data.get('date', '?')}\n"
+        f"Time: {data.get('time', '?')}\n"
+        f"Topic: {data.get('topic', '?')}"
+    )
+
+
+def _clip(text: str, limit: int = CALLBACK_ALERT_LIMIT) -> str:
+    """Trim text to the popup character cap, adding an ellipsis if cut."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# ── Reminders ─────────────────────────────────────────────────────────────────
+# We only ever track each chat's closest upcoming meeting. When it passes (or
+# when someone adds/removes meetings), we re-pick the closest and reschedule.
+
+def _chat_job_names(chat_id: int) -> tuple[str, str, str]:
+    return (
+        f"monday_reminder_{chat_id}",
+        f"six_h_reminder_{chat_id}",
+        f"rotate_{chat_id}",
     )
 
 
@@ -190,24 +232,24 @@ async def _send_six_hour_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _rotate_to_next_meeting(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fires shortly after the current closest meeting starts — pick the new closest."""
-    _reschedule_user_reminders(context.job_queue, context.job.chat_id)
+    _reschedule_chat_reminders(context.job_queue, context.job.chat_id)
 
 
-def _cancel_user_reminders(job_queue, user_id: int) -> None:
+def _cancel_chat_reminders(job_queue, chat_id: int) -> None:
     if job_queue is None:
         return
-    for name in _user_job_names(user_id):
+    for name in _chat_job_names(chat_id):
         for j in job_queue.get_jobs_by_name(name):
             j.schedule_removal()
 
 
-def _reschedule_user_reminders(job_queue, user_id: int) -> None:
-    """Cancel any pending reminders and re-arm them for the user's soonest meeting."""
+def _reschedule_chat_reminders(job_queue, chat_id: int) -> None:
+    """Cancel any pending reminders and re-arm them for the chat's soonest meeting."""
     if job_queue is None:
         return
-    _cancel_user_reminders(job_queue, user_id)
+    _cancel_chat_reminders(job_queue, chat_id)
 
-    upcoming, _ = _split_upcoming_past(meetings.get(user_id, []))
+    upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
     if not upcoming:
         return
     m = upcoming[0]
@@ -216,29 +258,29 @@ def _reschedule_user_reminders(job_queue, user_id: int) -> None:
         return
 
     now = datetime.now(meeting_dt.tzinfo)
-    monday_name, six_h_name, rotate_name = _user_job_names(user_id)
+    monday_name, six_h_name, rotate_name = _chat_job_names(chat_id)
 
     monday_dt = _monday_of_meeting_week(meeting_dt)
     if now < monday_dt < meeting_dt:
         job_queue.run_once(
             _send_monday_reminder,
             when=monday_dt,
-            chat_id=user_id,
+            chat_id=chat_id,
             data=m,
             name=monday_name,
         )
-        logger.info("Monday reminder for user=%s at %s", user_id, monday_dt.isoformat())
+        logger.info("Monday reminder for chat=%s at %s", chat_id, monday_dt.isoformat())
 
     six_h_dt = meeting_dt - timedelta(hours=HOURS_BEFORE_REMINDER)
     if six_h_dt > now:
         job_queue.run_once(
             _send_six_hour_reminder,
             when=six_h_dt,
-            chat_id=user_id,
+            chat_id=chat_id,
             data=m,
             name=six_h_name,
         )
-        logger.info("6h reminder for user=%s at %s", user_id, six_h_dt.isoformat())
+        logger.info("6h reminder for chat=%s at %s", chat_id, six_h_dt.isoformat())
 
     # Once this meeting starts, the next closest takes over — re-pick automatically.
     rotate_at = meeting_dt + timedelta(minutes=1)
@@ -246,7 +288,7 @@ def _reschedule_user_reminders(job_queue, user_id: int) -> None:
         job_queue.run_once(
             _rotate_to_next_meeting,
             when=rotate_at,
-            chat_id=user_id,
+            chat_id=chat_id,
             name=rotate_name,
         )
 
@@ -258,6 +300,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Hi! I'm your *Meeting Bot*.\n\n"
         "Commands:\n"
+        "  /menu – buttons that answer privately (only you see the popup)\n"
         "  /set\\_meeting – add a meeting\n"
         "  /show\\_next\\_meeting – view the closest upcoming meeting\n"
         "  /show\\_all\\_meetings – view all upcoming meetings (closest first)\n"
@@ -265,6 +308,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /clear\\_meeting – pick a meeting to remove\n"
         "  /help – show this message",
         parse_mode="Markdown",
+        reply_markup=_menu_markup(),
     )
 
 
@@ -392,16 +436,16 @@ async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return TOPIC
 
     context.user_data["topic"] = topic
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
     new_meeting = {
         "datetime":  context.user_data["datetime"],
         "source_tz": context.user_data["source_tz"],
         "topic":     context.user_data["topic"],
     }
-    meetings.setdefault(user_id, []).append(new_meeting)
+    meetings.setdefault(chat_id, []).append(new_meeting)
     save_meetings()
-    _reschedule_user_reminders(context.application.job_queue, user_id)
+    _reschedule_chat_reminders(context.application.job_queue, chat_id)
 
     await update.message.reply_text(
         "✅ Meeting saved!\n\n" + format_meeting(new_meeting)
@@ -425,8 +469,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ── /show_next_meeting & /show_all_meetings ───────────────────────────────────
 
 async def show_next_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    upcoming, _ = _split_upcoming_past(meetings.get(user_id, []))
+    chat_id = update.effective_chat.id
+    upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
     if not upcoming:
         await update.message.reply_text(
             "You have no upcoming meetings. Use /set\\_meeting to add one.",
@@ -440,8 +484,8 @@ async def show_next_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def show_all_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    upcoming, _ = _split_upcoming_past(meetings.get(user_id, []))
+    chat_id = update.effective_chat.id
+    upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
     if not upcoming:
         await update.message.reply_text(
             "You have no upcoming meetings. Use /set\\_meeting to add one.",
@@ -458,8 +502,8 @@ async def show_all_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ── /archive ───────────────────────────────────────────────────────────────────
 
 async def show_archive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    _, past = _split_upcoming_past(meetings.get(user_id, []))
+    chat_id = update.effective_chat.id
+    _, past = _split_upcoming_past(meetings.get(chat_id, []))
     if not past:
         await update.message.reply_text("📦 Archive is empty.")
         return
@@ -470,11 +514,75 @@ async def show_archive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+# ── /menu — inline buttons that answer privately in a popup ─────────────────────
+# Tapping a button triggers a callback we answer with show_alert=True, so the
+# reply appears as a popup ONLY to the person who tapped — the rest of the group
+# sees nothing. Great for groups where you don't want the bot spamming messages.
+
+def _menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 Next meeting", callback_data="show_next")],
+            [InlineKeyboardButton("🗓 All meetings", callback_data="show_all")],
+            [InlineKeyboardButton("📦 Archive", callback_data="show_archive")],
+        ]
+    )
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Post the button menu. The menu message itself is the only group-visible bit."""
+    await update.message.reply_text(
+        "Tap a button — the answer pops up only for you 👇",
+        reply_markup=_menu_markup(),
+    )
+
+
+def _next_meeting_text(chat_id: int) -> str:
+    upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
+    if not upcoming:
+        return "No upcoming meetings. Use /set_meeting to add one."
+    return "Your next meeting:\n\n" + format_meeting_plain(upcoming[0])
+
+
+def _all_meetings_text(chat_id: int) -> str:
+    upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
+    if not upcoming:
+        return "No upcoming meetings. Use /set_meeting to add one."
+    lines = [f"{i}. {_short_label_plain(m)}" for i, m in enumerate(upcoming, 1)]
+    return "Upcoming meetings:\n" + "\n".join(lines)
+
+
+def _archive_text(chat_id: int) -> str:
+    _, past = _split_upcoming_past(meetings.get(chat_id, []))
+    if not past:
+        return "Archive is empty."
+    lines = [f"{i}. {_short_label_plain(m)}" for i, m in enumerate(past, 1)]
+    return "Archived meetings:\n" + "\n".join(lines)
+
+
+async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Answer a menu button tap with a private popup."""
+    query = update.callback_query
+    chat_id = query.message.chat.id
+
+    if query.data == "show_next":
+        text = _next_meeting_text(chat_id)
+    elif query.data == "show_all":
+        text = _all_meetings_text(chat_id)
+    elif query.data == "show_archive":
+        text = _archive_text(chat_id)
+    else:
+        text = "Unknown action."
+
+    # show_alert=True => popup only the tapping user sees. Telegram caps it at 200.
+    await query.answer(text=_clip(text), show_alert=True)
+
+
 # ── /clear_meeting conversation ────────────────────────────────────────────────
 
 async def clear_meeting_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    upcoming, _ = _split_upcoming_past(meetings.get(user_id, []))
+    chat_id = update.effective_chat.id
+    upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
     if not upcoming:
         await update.message.reply_text(
             "Nothing upcoming to clear. Past meetings live in /archive."
@@ -499,16 +607,16 @@ async def clear_meeting_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def receive_clear_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = update.message.text.strip().lower()
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     upcoming = context.user_data.get("clear_list", [])
 
     if raw == "all":
-        items = meetings.get(user_id, [])
+        items = meetings.get(chat_id, [])
         # Keep past entries; drop the upcoming ones we showed. Compare by identity
         # so value-identical past/upcoming meetings aren't conflated.
-        meetings[user_id] = [m for m in items if all(m is not u for u in upcoming)]
+        meetings[chat_id] = [m for m in items if all(m is not u for u in upcoming)]
         save_meetings()
-        _reschedule_user_reminders(context.application.job_queue, user_id)
+        _reschedule_chat_reminders(context.application.job_queue, chat_id)
         await update.message.reply_text(
             f"🗑 Removed {len(upcoming)} upcoming meeting(s).",
             reply_markup=ReplyKeyboardRemove(),
@@ -532,7 +640,7 @@ async def receive_clear_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     target = upcoming[idx]
     try:
-        meetings.get(user_id, []).remove(target)
+        meetings.get(chat_id, []).remove(target)
     except ValueError:
         await update.message.reply_text(
             "Couldn't find that meeting anymore — it may have been removed already.",
@@ -541,7 +649,7 @@ async def receive_clear_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     save_meetings()
-    _reschedule_user_reminders(context.application.job_queue, user_id)
+    _reschedule_chat_reminders(context.application.job_queue, chat_id)
     await update.message.reply_text(
         f"🗑 Removed: *{escape_markdown(target.get('topic', '?'), version=1)}*",
         parse_mode="Markdown",
@@ -553,16 +661,16 @@ async def receive_clear_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ── App setup ──────────────────────────────────────────────────────────────────
 
 async def _schedule_all_on_startup(app: Application) -> None:
-    """After the JobQueue is up, arm reminders for each user's closest meeting."""
+    """After the JobQueue is up, arm reminders for each chat's closest meeting."""
     if app.job_queue is None:
         logger.warning(
             "JobQueue not available — reminders disabled. "
             "Install python-telegram-bot[job-queue]."
         )
         return
-    for user_id in meetings:
-        _reschedule_user_reminders(app.job_queue, user_id)
-    logger.info("Reminders armed for %d user(s)", len(meetings))
+    for chat_id in meetings:
+        _reschedule_chat_reminders(app.job_queue, chat_id)
+    logger.info("Reminders armed for %d chat(s)", len(meetings))
 
 
 def main() -> None:
@@ -572,7 +680,7 @@ def main() -> None:
     global meetings
     meetings = load_meetings()
     total = sum(len(v) for v in meetings.values())
-    logger.info("Loaded %d meeting(s) across %d user(s) from %s",
+    logger.info("Loaded %d meeting(s) across %d chat(s) from %s",
                 total, len(meetings), DATA_FILE)
 
     app = (
@@ -605,6 +713,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(set_conv)
     app.add_handler(clear_conv)
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CallbackQueryHandler(on_menu_button))
     app.add_handler(CommandHandler("show_next_meeting", show_next_meeting))
     app.add_handler(CommandHandler("show_all_meetings", show_all_meetings))
     app.add_handler(CommandHandler("archive", show_archive))
