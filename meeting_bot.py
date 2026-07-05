@@ -14,6 +14,7 @@ Usage:
 
 import os
 import json
+import uuid
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -67,7 +68,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ────────────────────────────────────────────────────────
-DATE, TIME, TIMEZONE, TOPIC, CLEAR_PICK = range(5)
+DATE, TIME, TIMEZONE, TOPIC = range(4)
 
 # ── Persistent storage (per chat) ─────────────────────────────────────────────
 # Structure: { chat_id: [ {"datetime": iso, "source_tz": label, "topic": str}, ... ] }
@@ -87,6 +88,11 @@ def load_meetings() -> dict[int, list[dict]]:
             elif isinstance(data, dict):
                 # Migrate legacy single-meeting schema into a one-item list.
                 result[cid_int] = [data]
+        # Ensure every meeting has a stable id (used to target it from inline
+        # buttons). Legacy entries saved before ids existed get one here.
+        for items in result.values():
+            for m in items:
+                m.setdefault("id", uuid.uuid4().hex[:8])
         return result
     except (json.JSONDecodeError, ValueError) as e:
         logging.getLogger(__name__).warning("Could not read %s: %s", DATA_FILE, e)
@@ -439,6 +445,7 @@ async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     chat_id = update.effective_chat.id
 
     new_meeting = {
+        "id":        uuid.uuid4().hex[:8],
         "datetime":  context.user_data["datetime"],
         "source_tz": context.user_data["source_tz"],
         "topic":     context.user_data["topic"],
@@ -578,84 +585,84 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer(text=_clip(text), show_alert=True)
 
 
-# ── /clear_meeting conversation ────────────────────────────────────────────────
+# ── /clear_meeting — inline buttons (works in groups, no spam) ──────────────────
+# The old flow used a ReplyKeyboardMarkup of numbers. Those taps are *plain
+# messages*, which Telegram's group privacy mode silently drops — so in a group
+# the pick never reached the bot and clearing "did nothing". Inline-button taps
+# (callback queries) are ALWAYS delivered, even with privacy mode on, and we
+# answer each with a private popup so we don't spam the group.
 
-async def clear_meeting_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+def _clear_keyboard(upcoming: list[dict]) -> InlineKeyboardMarkup:
+    """One button per upcoming meeting, plus ALL / Cancel."""
+    # Button labels are capped so long topics don't overflow the popup.
+    rows = [
+        [InlineKeyboardButton(f"🗑 {_short_label_plain(m)}"[:64],
+                              callback_data=f"clr:{m['id']}")]
+        for m in upcoming
+    ]
+    if len(upcoming) > 1:
+        rows.append([InlineKeyboardButton("🗑 Clear ALL upcoming",
+                                          callback_data="clr:all")])
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="clr:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def clear_meeting_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
     if not upcoming:
         await update.message.reply_text(
             "Nothing upcoming to clear. Past meetings live in /archive."
         )
-        return ConversationHandler.END
-
-    context.user_data["clear_list"] = upcoming
-    lines = [f"  *{i}.* {_short_label(m)}" for i, m in enumerate(upcoming, 1)]
-    numbers = [str(i) for i in range(1, len(upcoming) + 1)]
-    # Chunk number buttons so the keyboard stays usable.
-    rows = [numbers[i:i + 5] for i in range(0, len(numbers), 5)] + [["all", "/cancel"]]
-    keyboard = ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
+        return
     await update.message.reply_text(
-        "Which meeting would you like to remove?\n\n"
-        + "\n".join(lines)
-        + "\n\nReply with a number, *all*, or /cancel.",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
+        "Tap a meeting to remove it 👇",
+        reply_markup=_clear_keyboard(upcoming),
     )
-    return CLEAR_PICK
 
 
-async def receive_clear_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip().lower()
-    chat_id = update.effective_chat.id
-    upcoming = context.user_data.get("clear_list", [])
+async def on_clear_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a tap on a /clear_meeting inline button."""
+    query = update.callback_query
+    chat_id = query.message.chat.id
+    action = query.data.split(":", 1)[1]
 
-    if raw == "all":
+    if action == "cancel":
+        await query.answer("Cancelled.")
+        await query.edit_message_text("✖ Cancelled — nothing removed.")
+        return
+
+    if action == "all":
+        upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
+        removed = len(upcoming)
         items = meetings.get(chat_id, [])
-        # Keep past entries; drop the upcoming ones we showed. Compare by identity
-        # so value-identical past/upcoming meetings aren't conflated.
+        # Keep past entries; drop the upcoming ones. Compare by identity so
+        # value-identical past/upcoming meetings aren't conflated.
         meetings[chat_id] = [m for m in items if all(m is not u for u in upcoming)]
         save_meetings()
         _reschedule_chat_reminders(context.application.job_queue, chat_id)
-        await update.message.reply_text(
-            f"🗑 Removed {len(upcoming)} upcoming meeting(s).",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return ConversationHandler.END
+        await query.answer(_clip(f"Removed {removed} meeting(s)."), show_alert=True)
+        await query.edit_message_text(f"🗑 Removed {removed} upcoming meeting(s).")
+        return
 
-    try:
-        idx = int(raw) - 1
-    except ValueError:
-        await update.message.reply_text(
-            "Please reply with a number from the list, *all*, or /cancel.",
-            parse_mode="Markdown",
-        )
-        return CLEAR_PICK
+    # Otherwise `action` is a meeting id.
+    items = meetings.get(chat_id, [])
+    target = next((m for m in items if m.get("id") == action), None)
+    if target is not None:
+        items.remove(target)
+        save_meetings()
+        _reschedule_chat_reminders(context.application.job_queue, chat_id)
+        await query.answer(_clip(f"Removed: {target.get('topic', '?')}"),
+                           show_alert=True)
+    else:
+        await query.answer("That meeting was already removed.", show_alert=True)
 
-    if not (0 <= idx < len(upcoming)):
-        await update.message.reply_text(
-            "That number isn't in the list. Try again or /cancel."
-        )
-        return CLEAR_PICK
-
-    target = upcoming[idx]
-    try:
-        meetings.get(chat_id, []).remove(target)
-    except ValueError:
-        await update.message.reply_text(
-            "Couldn't find that meeting anymore — it may have been removed already.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return ConversationHandler.END
-
-    save_meetings()
-    _reschedule_chat_reminders(context.application.job_queue, chat_id)
-    await update.message.reply_text(
-        f"🗑 Removed: *{escape_markdown(target.get('topic', '?'), version=1)}*",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return ConversationHandler.END
+    # Refresh the picker so the removed entry disappears for everyone.
+    upcoming, _ = _split_upcoming_past(meetings.get(chat_id, []))
+    if upcoming:
+        await query.edit_message_reply_markup(reply_markup=_clear_keyboard(upcoming))
+    else:
+        await query.edit_message_text("🗑 No more upcoming meetings.")
 
 
 # ── App setup ──────────────────────────────────────────────────────────────────
@@ -701,20 +708,15 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    clear_conv = ConversationHandler(
-        entry_points=[CommandHandler("clear_meeting", clear_meeting_start)],
-        states={
-            CLEAR_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_clear_pick)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(set_conv)
-    app.add_handler(clear_conv)
+    app.add_handler(CommandHandler("clear_meeting", clear_meeting_start))
     app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CallbackQueryHandler(on_menu_button))
+    # Scope the callback handlers by prefix so menu taps and clear taps don't
+    # swallow each other.
+    app.add_handler(CallbackQueryHandler(on_menu_button, pattern="^show_"))
+    app.add_handler(CallbackQueryHandler(on_clear_button, pattern="^clr:"))
     app.add_handler(CommandHandler("show_next_meeting", show_next_meeting))
     app.add_handler(CommandHandler("show_all_meetings", show_all_meetings))
     app.add_handler(CommandHandler("archive", show_archive))
